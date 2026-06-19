@@ -87,7 +87,7 @@ def get_user(data, user_id, username=""):
 
     if user_id not in data["users"]:
         data["users"][user_id] = {
-            "balance": 0,
+            "balance": 10,
             "created_tasks": 0,
             "completed_tasks": 0,
             "earned": 0,
@@ -204,6 +204,21 @@ def state_handler(message):
             bot.send_message(message.chat.id, "⚠️ Награда должна быть числом. Например: 1")
             return
 
+        data = load_data()
+        user = get_user(data, uid, message.from_user.username or "")
+
+        if user["balance"] < reward:
+            bot.send_message(
+                message.chat.id,
+                f"❌ Недостаточно баллов для создания задания.\n\n"
+                f"💎 Награда: {reward} баллов\n"
+                f"💰 Ваш баланс: {user['balance']} баллов\n\n"
+                f"Укажите награду меньше или заработайте ещё баллы.",
+                reply_markup=main_kb()
+            )
+            states.pop(uid, None)
+            return
+
         state["reward"] = reward
         state["step"] = "limit"
 
@@ -226,6 +241,21 @@ def state_handler(message):
         data = load_data()
         user = get_user(data, uid, message.from_user.username or "")
 
+        reward = int(state["reward"])
+
+        if user["balance"] < reward:
+            bot.send_message(
+                message.chat.id,
+                f"❌ Недостаточно баллов для создания задания.\n\n"
+                f"💎 Нужно: {reward} баллов\n"
+                f"💰 Ваш баланс: {user['balance']} баллов",
+                reply_markup=main_kb()
+            )
+            states.pop(uid, None)
+            return
+
+        user["balance"] -= reward
+
         data["last_task_id"] += 1
         task_id = str(data["last_task_id"])
 
@@ -238,6 +268,7 @@ def state_handler(message):
             "reward": state["reward"],
             "limit": limit,
             "done": 0,
+            "escrow": reward,
             "created_at": now()
         }
 
@@ -252,7 +283,9 @@ def state_handler(message):
             f"📝 Описание: {state['description']}\n"
             f"🎁 Награда: {state['reward']} балл\n"
             f"👥 Нужно: {limit}\n"
-            f"📊 Выполнено: 0/{limit}",
+            f"📊 Выполнено: 0/{limit}\n"
+            f"💰 С баланса списано: {reward} баллов\n"
+            f"💎 Ваш баланс: {user['balance']} баллов",
             reply_markup=main_kb()
         )
 
@@ -274,7 +307,11 @@ def show_tasks(message):
                 already = True
                 break
 
-        if not already:
+        owner = get_user(data, task["owner_id"])
+        task_escrow = int(task.get("escrow", 0))
+        task_reward = int(task.get("reward", 0))
+
+        if not already and (task_escrow >= task_reward or owner["balance"] >= task_reward):
             available.append(task)
 
     if not available:
@@ -321,6 +358,22 @@ def done_task(call):
         if str(req["task_id"]) == str(task_id) and int(req["worker_id"]) == uid:
             bot.answer_callback_query(call.id, "Вы уже отправили заявку.")
             return
+
+    owner = get_user(data, task["owner_id"])
+    reward = int(task["reward"])
+
+    if int(task.get("escrow", 0)) >= reward:
+        task["escrow"] = int(task.get("escrow", 0)) - reward
+    else:
+        if owner["balance"] < reward:
+            bot.answer_callback_query(call.id, "У создателя задания не хватает баллов.")
+            bot.send_message(
+                call.message.chat.id,
+                "⚠️ Сейчас это задание недоступно: у создателя не хватает баллов на награду."
+            )
+            save_data(data)
+            return
+        owner["balance"] -= reward
 
     data["last_request_id"] += 1
     request_id = str(data["last_request_id"])
@@ -393,6 +446,9 @@ def approve_reject(call):
     reward = int(req["reward"])
 
     if action == "reject":
+        owner = get_user(data, req["owner_id"])
+        owner["balance"] += reward
+
         del data["requests"][request_id]
         save_data(data)
 
@@ -400,12 +456,16 @@ def approve_reject(call):
             bot.send_message(
                 int(worker_id),
                 "❌ <b>Задание отклонено.</b>\n\n"
-                "Создатель не подтвердил, что реферал пришёл."
+                "Реферал не засчитался."
             )
         except Exception:
             pass
 
-        bot.edit_message_text("❌ Вы отклонили заявку.", call.message.chat.id, call.message.message_id)
+        bot.edit_message_text(
+            f"❌ Вы отклонили заявку.\n\n💰 {reward} баллов возвращено на ваш баланс.",
+            call.message.chat.id,
+            call.message.message_id
+        )
         bot.answer_callback_query(call.id, "Отклонено.")
         return
 
@@ -518,19 +578,26 @@ def delete_task(message):
         bot.send_message(message.chat.id, "⚠️ Задание не найдено.")
         return
 
-    del data["tasks"][task_id]
+    task = data["tasks"][task_id]
+    owner = get_user(data, task["owner_id"])
+    refund = int(task.get("escrow", 0))
 
     to_delete = []
     for req_id, req in data["requests"].items():
         if str(req["task_id"]) == str(task_id):
+            refund += int(req.get("reward", 0))
             to_delete.append(req_id)
+
+    owner["balance"] += refund
+
+    del data["tasks"][task_id]
 
     for req_id in to_delete:
         del data["requests"][req_id]
 
     save_data(data)
 
-    bot.send_message(message.chat.id, f"✅ Задание #{task_id} удалено.")
+    bot.send_message(message.chat.id, f"✅ Задание #{task_id} удалено. Возврат: {refund} баллов.")
 
 
 if __name__ == "__main__":
