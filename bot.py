@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import re
 import threading
 from datetime import datetime, timedelta
 
@@ -532,15 +533,19 @@ def done_task(call):
     try:
         bot.send_message(
             int(task["owner_id"]),
-            f"📩 <b>Новая заявка на проверку</b>\n\n"
+            f"📩 <b>Новая заявка на проверку #{request_id}</b>\n\n"
             f"📋 Задание #{task_id}\n"
             f"👤 Пользователь: {worker_name}\n"
             f"🎁 Награда: {task['reward']} балл\n"
             f"📊 Сейчас рефов: {task['done']}/{task['limit']}\n\n"
             f"📝 Условие:\n{task['description']}\n\n"
             f"📎 Ссылка:\n{task['link']}\n\n"
-            f"Проверьте, пришёл ли реферал.\n"
-            f"Если пришёл — нажмите ✅ Одобрить.",
+            f"Проверьте, пришёл ли реферал.\n\n"
+            f"👇 Нажмите кнопку <b>Одобрить/Отклонить</b>.\n"
+            f"Если кнопки не нажимаются — напишите в чат:\n"
+            f"<code>одобрить {request_id}</code>\n"
+            f"или\n"
+            f"<code>отклонить {request_id}</code>",
             reply_markup=kb
         )
     except Exception:
@@ -553,23 +558,34 @@ def done_task(call):
         "Создатель проверит, пришёл ли реферал."
     )
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith("approve:") or call.data.startswith("reject:"))
-def approve_reject(call):
-    action, request_id = call.data.split(":")
+def process_request_decision(action, request_id, actor_id, chat_id=None, callback_call=None):
+    """Обработка заявки через кнопку или текстом в чат.
+    action: approve / reject
+    request_id: номер заявки
+    actor_id: кто принимает решение (должен быть создателем задания)
+    """
     data = load_clean_data()
+    request_id = str(request_id).strip()
+
+    def answer(text):
+        if callback_call:
+            bot.answer_callback_query(callback_call.id, text)
+        elif chat_id:
+            bot.send_message(chat_id, text, reply_markup=main_kb())
 
     if request_id not in data["requests"]:
-        bot.answer_callback_query(call.id, "Заявка уже обработана.")
-        try:
-            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
-        except Exception:
-            pass
+        answer("⚠️ Заявка уже обработана или не найдена.")
+        if callback_call:
+            try:
+                bot.edit_message_reply_markup(callback_call.message.chat.id, callback_call.message.message_id, reply_markup=None)
+            except Exception:
+                pass
         return
 
     req = data["requests"][request_id]
 
-    if str(req["owner_id"]) != str(call.from_user.id):
-        bot.answer_callback_query(call.id, "Это может подтвердить только создатель задания.")
+    if str(req["owner_id"]) != str(actor_id):
+        answer("⚠️ Это может подтвердить только создатель задания.")
         return
 
     task_id = str(req["task_id"])
@@ -582,7 +598,10 @@ def approve_reject(call):
         owner["balance"] += reward
 
         if task_id in data["tasks"]:
-            data["tasks"][task_id]["pending_users"] = [str(x) for x in data["tasks"][task_id].get("pending_users", []) if str(x) != worker_id]
+            data["tasks"][task_id]["pending_users"] = [
+                str(x) for x in data["tasks"][task_id].get("pending_users", [])
+                if str(x) != worker_id
+            ]
 
         del data["requests"][request_id]
         save_data(data)
@@ -596,15 +615,22 @@ def approve_reject(call):
         except Exception:
             pass
 
-        bot.edit_message_text(
-            f"❌ Вы отклонили заявку.\n\n"
-            f"💎 {reward} балл возвращён вам на баланс.",
-            call.message.chat.id,
-            call.message.message_id
+        text = (
+            f"❌ <b>Заявка #{request_id} отклонена.</b>\n\n"
+            f"💎 {reward} балл возвращён вам на баланс."
         )
-        bot.answer_callback_query(call.id, "Отклонено.")
+
+        if callback_call:
+            try:
+                bot.edit_message_text(text, callback_call.message.chat.id, callback_call.message.message_id)
+            except Exception:
+                bot.send_message(callback_call.message.chat.id, text)
+            bot.answer_callback_query(callback_call.id, "Отклонено.")
+        else:
+            bot.send_message(chat_id, text, reply_markup=main_kb())
         return
 
+    # approve
     worker = get_user(data, worker_id)
     worker["balance"] += reward
     worker["completed_tasks"] += 1
@@ -629,8 +655,6 @@ def approve_reject(call):
         task_done_text = f"{done}/{limit}"
         task_finished = finish_task_if_needed(data, task_id)
     else:
-        done = 0
-        limit = 0
         task_done_text = "завершено"
         task_finished = True
 
@@ -649,20 +673,40 @@ def approve_reject(call):
 
     if task_finished:
         text = (
-            f"✅ Вы одобрили заявку.\n\n"
+            f"✅ <b>Заявка #{request_id} одобрена.</b>\n\n"
             f"🎁 Награда начислена пользователю.\n"
             f"📊 Рефов пришло: {task_done_text}\n\n"
             f"🏁 Лимит выполнен, задание удалено."
         )
     else:
         text = (
-            f"✅ Вы одобрили заявку.\n\n"
+            f"✅ <b>Заявка #{request_id} одобрена.</b>\n\n"
             f"🎁 Награда начислена пользователю.\n"
             f"📊 Рефов пришло: {task_done_text}"
         )
 
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id)
-    bot.answer_callback_query(call.id, "Одобрено.")
+    if callback_call:
+        try:
+            bot.edit_message_text(text, callback_call.message.chat.id, callback_call.message.message_id)
+        except Exception:
+            bot.send_message(callback_call.message.chat.id, text)
+        bot.answer_callback_query(callback_call.id, "Одобрено.")
+    else:
+        bot.send_message(chat_id, text, reply_markup=main_kb())
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("approve:") or call.data.startswith("reject:"))
+def approve_reject(call):
+    action, request_id = call.data.split(":")
+    process_request_decision(action, request_id, call.from_user.id, callback_call=call)
+
+@bot.message_handler(func=lambda m: bool(m.text) and re.match(r"^\s*(одобрить|отклонить|approve|reject)\s+\d+\s*$", m.text.lower()))
+def approve_reject_by_text(message):
+    parts = message.text.lower().strip().split()
+    word = parts[0]
+    request_id = parts[1]
+
+    action = "approve" if word in ("одобрить", "approve") else "reject"
+    process_request_decision(action, request_id, message.from_user.id, chat_id=message.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "👤 Профиль")
 def profile(message):
