@@ -11,7 +11,7 @@ from flask import Flask
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬ_ТОКЕН_БОТА")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
-SITE_URL = os.getenv("SITE_URL", "")
+SITE_URL = os.getenv("SITE_URL", "https://refesh.onrender.com/")
 
 DATA_FILE = "data.json"
 TASK_LIFETIME_DAYS = int(os.getenv("TASK_LIFETIME_DAYS", "7"))  # через сколько дней старое задание удаляется
@@ -29,14 +29,19 @@ def run_site():
     app.run(host="0.0.0.0", port=port)
 
 def keep_ping():
+    """Пингует сайт каждые 5 минут, чтобы Render не засыпал."""
     while True:
         try:
-            if SITE_URL:
-                requests.get(SITE_URL, timeout=10)
-                print("PING OK")
+            url = (SITE_URL or "https://refesh.onrender.com/").strip()
+            if not url.startswith("http"):
+                url = "https://" + url
+
+            r = requests.get(url, timeout=15)
+            print(f"PING OK: {url} | status={r.status_code}")
         except Exception as e:
             print("PING ERROR:", e)
-        time.sleep(300)
+
+        time.sleep(300)  # 5 минут
 
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
