@@ -2,7 +2,7 @@ import os
 import json
 import time
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import telebot
@@ -14,6 +14,7 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 SITE_URL = os.getenv("SITE_URL", "")
 
 DATA_FILE = "data.json"
+TASK_LIFETIME_DAYS = int(os.getenv("TASK_LIFETIME_DAYS", "7"))  # через сколько дней старое задание удаляется
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 app = Flask(__name__)
@@ -40,6 +41,15 @@ def keep_ping():
 def now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+def parse_dt(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return datetime.now()
+
+def dt_text(dt):
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
 def empty_data():
     return {
         "last_task_id": 0,
@@ -47,7 +57,8 @@ def empty_data():
         "users": {},
         "tasks": {},
         "requests": {},
-        "completed": {}
+        "completed": {},
+        "archived_tasks": {}
     }
 
 def load_data():
@@ -60,6 +71,13 @@ def load_data():
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
+        # Если файл вдруг сломался, не затираем его молча, а сохраняем копию.
+        try:
+            broken_name = DATA_FILE + ".broken_" + str(int(time.time()))
+            os.replace(DATA_FILE, broken_name)
+            print("DATA FILE BROKEN, BACKUP:", broken_name)
+        except Exception:
+            pass
         data = empty_data()
         save_data(data)
         return data
@@ -68,6 +86,26 @@ def load_data():
     for key in base:
         if key not in data:
             data[key] = base[key]
+
+    # Миграция старых заданий, чтобы новые поля не ломали старые data.json.
+    changed = False
+    for task_id, task in list(data.get("tasks", {}).items()):
+        created = task.get("created_at") or now()
+        if "expires_at" not in task:
+            task["expires_at"] = dt_text(parse_dt(created) + timedelta(days=TASK_LIFETIME_DAYS))
+            changed = True
+        if "done_users" not in task:
+            task["done_users"] = []
+            changed = True
+        if "pending_users" not in task:
+            task["pending_users"] = []
+            changed = True
+        if "status" not in task:
+            task["status"] = "active"
+            changed = True
+
+    if changed:
+        save_data(data)
 
     return data
 
@@ -95,6 +133,77 @@ def get_user(data, user_id, username=""):
 
     return data["users"][user_id]
 
+def cleanup_old_tasks(data):
+    """Удаляет старые задания и возвращает владельцу неиспользованный резерв."""
+    deleted = []
+    current = datetime.now()
+
+    for task_id, task in list(data.get("tasks", {}).items()):
+        expires_at = parse_dt(task.get("expires_at", task.get("created_at", now())))
+        if current < expires_at:
+            continue
+
+        owner = get_user(data, task.get("owner_id"))
+        left = max(0, int(task.get("limit", 0)) - int(task.get("done", 0)))
+        refund = left * int(task.get("reward", 0))
+        owner["balance"] += refund
+
+        data["archived_tasks"][str(task_id)] = {
+            **task,
+            "status": "expired",
+            "expired_at": now(),
+            "refund": refund
+        }
+        del data["tasks"][str(task_id)]
+        deleted.append((str(task_id), int(task.get("owner_id", 0)), refund))
+
+        # Все висящие заявки по старому заданию удаляем, чтобы не было повторок.
+        for req_id, req in list(data.get("requests", {}).items()):
+            if str(req.get("task_id")) == str(task_id):
+                del data["requests"][req_id]
+
+    return deleted
+
+def load_clean_data():
+    data = load_data()
+    deleted = cleanup_old_tasks(data)
+    if deleted:
+        save_data(data)
+        for task_id, owner_id, refund in deleted:
+            try:
+                bot.send_message(
+                    int(owner_id),
+                    f"🗑 <b>Задание #{task_id} автоматически удалено.</b>\n\n"
+                    f"Причина: задание старше {TASK_LIFETIME_DAYS} дней.\n"
+                    f"💎 Возврат за невыполненные рефы: {refund}"
+                )
+            except Exception:
+                pass
+    return data
+
+def finish_task_if_needed(data, task_id):
+    task = data["tasks"].get(str(task_id))
+    if not task:
+        return False
+
+    if int(task.get("done", 0)) < int(task.get("limit", 0)):
+        return False
+
+    data["archived_tasks"][str(task_id)] = {
+        **task,
+        "status": "completed",
+        "finished_at": now(),
+        "refund": 0
+    }
+    del data["tasks"][str(task_id)]
+
+    # На всякий случай удаляем все заявки по закрытому заданию.
+    for req_id, req in list(data.get("requests", {}).items()):
+        if str(req.get("task_id")) == str(task_id):
+            del data["requests"][req_id]
+
+    return True
+
 def main_kb():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("➕ Добавить ссылку")
@@ -109,7 +218,7 @@ def cancel_kb():
 
 @bot.message_handler(commands=["start"])
 def start(message):
-    data = load_data()
+    data = load_clean_data()
     get_user(data, message.from_user.id, message.from_user.username or "")
     save_data(data)
 
@@ -196,7 +305,7 @@ def state_handler(message):
             bot.send_message(message.chat.id, "⚠️ Награда должна быть числом. Например: 1")
             return
 
-        data = load_data()
+        data = load_clean_data()
         user = get_user(data, uid, message.from_user.username or "")
 
         if user["balance"] < reward:
@@ -230,7 +339,7 @@ def state_handler(message):
             bot.send_message(message.chat.id, "⚠️ Количество должно быть числом. Например: 4")
             return
 
-        data = load_data()
+        data = load_clean_data()
         user = get_user(data, uid, message.from_user.username or "")
 
         total_price = int(state["reward"]) * limit
@@ -254,6 +363,7 @@ def state_handler(message):
         data["last_task_id"] += 1
         task_id = str(data["last_task_id"])
 
+        created_at = datetime.now()
         data["tasks"][task_id] = {
             "id": task_id,
             "owner_id": uid,
@@ -263,8 +373,12 @@ def state_handler(message):
             "reward": int(state["reward"]),
             "limit": limit,
             "done": 0,
+            "done_users": [],
+            "pending_users": [],
             "reserved_balance": total_price,
-            "created_at": now()
+            "status": "active",
+            "created_at": dt_text(created_at),
+            "expires_at": dt_text(created_at + timedelta(days=TASK_LIFETIME_DAYS))
         }
 
         user["created_tasks"] += 1
@@ -278,7 +392,8 @@ def state_handler(message):
             f"📝 Описание: {state['description']}\n"
             f"🎁 Награда: {state['reward']} балл\n"
             f"👥 Нужно рефов: {limit}\n"
-            f"📊 Пришло рефов: 0/{limit}\n\n"
+            f"📊 Пришло рефов: 0/{limit}\n"
+            f"🕒 Автоудаление через: {TASK_LIFETIME_DAYS} дней\n\n"
             f"💎 Списано с баланса: {total_price}\n"
             f"💰 Остаток: {user['balance']}",
             reply_markup=main_kb()
@@ -286,13 +401,22 @@ def state_handler(message):
 
 @bot.message_handler(func=lambda m: m.text == "📋 Задания")
 def show_tasks(message):
-    data = load_data()
+    data = load_clean_data()
     uid = str(message.from_user.id)
 
     available = []
 
     for task_id, task in data["tasks"].items():
         if str(task["owner_id"]) == uid:
+            continue
+
+        if int(task.get("done", 0)) >= int(task.get("limit", 0)):
+            continue
+
+        if uid in [str(x) for x in task.get("done_users", [])]:
+            continue
+
+        if uid in [str(x) for x in task.get("pending_users", [])]:
             continue
 
         # если пользователь уже отправлял заявку или уже выполнил это задание — не показываем только ему
@@ -325,7 +449,8 @@ def show_tasks(message):
         f"📋 <b>Задание #{task['id']}</b>\n\n"
         f"📝 {task['description']}\n"
         f"🎁 Награда: {task['reward']} балл\n"
-        f"📊 Рефов пришло: {task['done']}/{task['limit']}\n\n"
+        f"📊 Рефов пришло: {task['done']}/{task['limit']}\n"
+        f"🕒 Активно до: {task.get('expires_at', 'не указано')}\n\n"
         f"1️⃣ Нажмите «Перейти»\n"
         f"2️⃣ Выполните условия\n"
         f"3️⃣ Нажмите «Я выполнил»\n\n"
@@ -336,7 +461,7 @@ def show_tasks(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("done:"))
 def done_task(call):
     task_id = call.data.split(":")[1]
-    data = load_data()
+    data = load_clean_data()
     uid = str(call.from_user.id)
 
     if task_id not in data["tasks"]:
@@ -345,11 +470,25 @@ def done_task(call):
 
     task = data["tasks"][task_id]
 
+    if int(task.get("done", 0)) >= int(task.get("limit", 0)):
+        finish_task_if_needed(data, task_id)
+        save_data(data)
+        bot.answer_callback_query(call.id, "Задание уже набрало нужных рефов.")
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
+        return
+
     if str(task["owner_id"]) == uid:
         bot.answer_callback_query(call.id, "Нельзя выполнять своё задание.")
         return
 
     completed_key = f"{task_id}:{uid}"
+    if uid in [str(x) for x in task.get("done_users", [])] or uid in [str(x) for x in task.get("pending_users", [])]:
+        bot.answer_callback_query(call.id, "Вы уже отправляли это задание.")
+        return
+
     if completed_key in data["completed"]:
         bot.answer_callback_query(call.id, "Вы уже выполняли это задание.")
         return
@@ -361,6 +500,8 @@ def done_task(call):
 
     data["last_request_id"] += 1
     request_id = str(data["last_request_id"])
+
+    task.setdefault("pending_users", []).append(uid)
 
     data["requests"][request_id] = {
         "id": request_id,
@@ -410,7 +551,7 @@ def done_task(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith("approve:") or call.data.startswith("reject:"))
 def approve_reject(call):
     action, request_id = call.data.split(":")
-    data = load_data()
+    data = load_clean_data()
 
     if request_id not in data["requests"]:
         bot.answer_callback_query(call.id, "Заявка уже обработана.")
@@ -434,6 +575,9 @@ def approve_reject(call):
     if action == "reject":
         owner = get_user(data, owner_id)
         owner["balance"] += reward
+
+        if task_id in data["tasks"]:
+            data["tasks"][task_id]["pending_users"] = [str(x) for x in data["tasks"][task_id].get("pending_users", []) if str(x) != worker_id]
 
         del data["requests"][request_id]
         save_data(data)
@@ -469,17 +613,16 @@ def approve_reject(call):
     }
 
     if task_id in data["tasks"]:
-        data["tasks"][task_id]["done"] += 1
-        done = data["tasks"][task_id]["done"]
-        limit = data["tasks"][task_id]["limit"]
+        task = data["tasks"][task_id]
+        task["pending_users"] = [str(x) for x in task.get("pending_users", []) if str(x) != worker_id]
+        if worker_id not in [str(x) for x in task.get("done_users", [])]:
+            task.setdefault("done_users", []).append(worker_id)
+            task["done"] = int(task.get("done", 0)) + 1
 
+        done = int(task.get("done", 0))
+        limit = int(task.get("limit", 0))
         task_done_text = f"{done}/{limit}"
-
-        if done >= limit:
-            del data["tasks"][task_id]
-            task_finished = True
-        else:
-            task_finished = False
+        task_finished = finish_task_if_needed(data, task_id)
     else:
         done = 0
         limit = 0
@@ -518,7 +661,7 @@ def approve_reject(call):
 
 @bot.message_handler(func=lambda m: m.text == "👤 Профиль")
 def profile(message):
-    data = load_data()
+    data = load_clean_data()
     user = get_user(data, message.from_user.id, message.from_user.username or "")
     save_data(data)
 
@@ -535,7 +678,7 @@ def profile(message):
 
 @bot.message_handler(func=lambda m: m.text == "📊 Мои задания")
 def my_tasks(message):
-    data = load_data()
+    data = load_clean_data()
     uid = str(message.from_user.id)
 
     my = []
@@ -554,7 +697,9 @@ def my_tasks(message):
             f"📋 <b>Задание #{task['id']}</b>\n"
             f"📝 {task['description']}\n"
             f"🎁 Награда: {task['reward']} балл\n"
-            f"📊 Рефов пришло: {task['done']}/{task['limit']}\n\n"
+            f"📊 Рефов пришло: {task['done']}/{task['limit']}\n"
+            f"💎 Резерв на невыполненные: {max(0, (int(task['limit']) - int(task['done'])) * int(task['reward']))}\n"
+            f"🕒 Активно до: {task.get('expires_at', 'не указано')}\n\n"
         )
 
     bot.send_message(message.chat.id, text, reply_markup=main_kb())
@@ -564,7 +709,7 @@ def stats(message):
     if ADMIN_ID != 0 and message.from_user.id != ADMIN_ID:
         return
 
-    data = load_data()
+    data = load_clean_data()
 
     bot.send_message(
         message.chat.id,
@@ -572,7 +717,8 @@ def stats(message):
         f"👤 Пользователей: {len(data['users'])}\n"
         f"📋 Активных заданий: {len(data['tasks'])}\n"
         f"⏳ Заявок на проверке: {len(data['requests'])}\n"
-        f"✅ Выполнений в истории: {len(data['completed'])}"
+        f"✅ Выполнений в истории: {len(data['completed'])}\n"
+        f"🗂 Архив заданий: {len(data.get('archived_tasks', {}))}"
     )
 
 @bot.message_handler(commands=["delete_task"])
@@ -587,7 +733,7 @@ def delete_task(message):
         return
 
     task_id = parts[1]
-    data = load_data()
+    data = load_clean_data()
 
     if task_id not in data["tasks"]:
         bot.send_message(message.chat.id, "⚠️ Задание не найдено.")
@@ -618,9 +764,18 @@ def delete_task(message):
         f"💎 Возврат владельцу: {refund}"
     )
 
+def cleanup_loop():
+    while True:
+        try:
+            load_clean_data()
+        except Exception as e:
+            print("CLEANUP ERROR:", e)
+        time.sleep(3600)
+
 if __name__ == "__main__":
     threading.Thread(target=run_site, daemon=True).start()
     threading.Thread(target=keep_ping, daemon=True).start()
+    threading.Thread(target=cleanup_loop, daemon=True).start()
 
     print("BOT STARTED ✅")
 
