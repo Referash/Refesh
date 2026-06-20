@@ -253,6 +253,17 @@ def add_link(message):
 @bot.message_handler(func=lambda m: m.from_user.id in states)
 def state_handler(message):
     uid = message.from_user.id
+
+    # Важно: если у создателя задания открыт какой-то шаг создания ссылки,
+    # команда "одобрить 2" всё равно должна работать, а не попадать в анкету.
+    if message.text:
+        decision_text = message.text.lower().strip()
+        if re.match(r"^(одобрить|отклонить|approve|reject)\s+\d+$", decision_text):
+            parts = decision_text.split()
+            action = "approve" if parts[0] in ("одобрить", "approve") else "reject"
+            process_request_decision(action, parts[1], message.from_user.id, chat_id=message.chat.id)
+            return
+
     state = states[uid]
 
     if message.text == "❌ Отмена":
@@ -707,6 +718,23 @@ def approve_reject_by_text(message):
 
     action = "approve" if word in ("одобрить", "approve") else "reject"
     process_request_decision(action, request_id, message.from_user.id, chat_id=message.chat.id)
+
+@bot.message_handler(commands=["approve", "reject"])
+def approve_reject_by_command(message):
+    parts = message.text.lower().strip().split()
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        bot.send_message(
+            message.chat.id,
+            "⚠️ Напишите так:\n"
+            "<code>/approve 2</code> — одобрить\n"
+            "<code>/reject 2</code> — отклонить"
+        )
+        return
+
+    command = parts[0].replace("/", "")
+    action = "approve" if command == "approve" else "reject"
+    process_request_decision(action, parts[1], message.from_user.id, chat_id=message.chat.id)
 
 @bot.message_handler(func=lambda m: m.text == "👤 Профиль")
 def profile(message):
